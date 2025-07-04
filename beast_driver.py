@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 BEAST NTL Cyclone Disturbance Detector
-Author: Afrozen (July 2025)
+Author: Nazia Afroze (July 2025)
 Description: Runs BEAST on NTL data per settlement, detects disturbances within ±60 days of cyclone, and generates plots + stats.
 """
 
@@ -37,7 +37,7 @@ def process_settlement(settlement_id, df_ntl, output_dir, summary_records, cyclo
     its_data['NTLmean'] = detect_and_remove_outliers(its_data['NTLmean'])
     its_data.dropna(inplace=True)
 
-    # Skip low-signal or insufficient data
+    # Skip low-signal or insufficient data (Need to set threshold instead of 0)
     if its_data['NTLmean'].mean() < 0 or len(its_data) < 365:
         print(f"⚠️ Skipped {settlement_id}: insufficient brightness or data")
         return False
