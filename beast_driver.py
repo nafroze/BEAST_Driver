@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 BEAST NTL Cyclone Disturbance Detector
-Author: Afrozen (July 2025)
+Author: Nazia Afroze (July 2025)
 Description: Runs BEAST on NTL data per settlement, detects disturbances within ±60 days of cyclone, and generates plots + stats.
 """
 
@@ -19,32 +19,36 @@ import Rbeast
 
 # === Outlier detection ===
 def detect_and_remove_outliers(data, threshold=3.5):
+    # Removes values with large z-scores to reduce noise in NTL signal
     z_scores = np.abs((data - data.mean()) / data.std())
     return data[z_scores < threshold]
 
 # === Cohen's d calculation ===
 def cohen_d(before, after):
+    # ➤ Metric: Cohen's d — Quantifies effect size (how strong is the NTL drop)
     diff = np.mean(after) - np.mean(before)
     pooled_std = np.sqrt((np.std(before)**2 + np.std(after)**2) / 2)
     return diff / pooled_std
 
 # === Core processor per settlement ===
 def process_settlement(settlement_id, df_ntl, output_dir, summary_records, cyclone_date=None):
-    # Subset data for this settlement
+    # Subset and clean data
     its_data = df_ntl[df_ntl['settl_pcod'] == settlement_id].copy()
     its_data['NTLmean'] = detect_and_remove_outliers(its_data['NTLmean'])
     its_data.dropna(inplace=True)
 
+    # Skip low-signal or insufficient data (Need to set threshold instead of 0)
     if its_data['NTLmean'].mean() < 0 or len(its_data) < 365:
         print(f"⚠️ Skipped {settlement_id}: insufficient brightness or data")
         return False
 
     try:
+        # Run BEAST on NTL time series (trend-only)
         beast_result = Rbeast.beast(its_data['NTLmean'].values, season='none', prior={'trendMinOrder': 0, 'trendMaxOrder': 1})
     except:
         return False
 
-    # Extract change points
+    # Extract change points from BEAST model
     raw_cps = np.array(getattr(beast_result.trend, 'cp', []))
     cps = raw_cps[~np.isnan(raw_cps)].astype(int)
     trend_values = np.array(getattr(beast_result.trend, 'Y', beast_result.trend))
@@ -52,45 +56,61 @@ def process_settlement(settlement_id, df_ntl, output_dir, summary_records, cyclo
     if len(cps) == 0:
         return False
 
+    # Align data with BEAST trend length
     min_len = min(len(trend_values), len(its_data))
     its_data = its_data.iloc[:min_len]
     its_data['BEAST_Trend'] = trend_values[:min_len]
+
+    # ➤ Metric: Deviation — Actual NTL minus BEAST trend (tracks drop/recovery)
     its_data['Deviation'] = its_data['NTLmean'] - its_data['BEAST_Trend']
 
+    # Define analysis window around cyclone
     cyclone_date = pd.to_datetime(cyclone_date)
     window_start = cyclone_date - timedelta(days=60)
     window_end = cyclone_date + timedelta(days=60)
 
-    # Identify candidate disturbance CPs in window with negative drop
+    # ➤ Filter: Only keep change points in the disturbance window with negative trend drop
     window_cps = [i for i in cps if window_start <= its_data.index[i] <= window_end and trend_values[i + 1] < trend_values[i]]
     if len(window_cps) == 0:
         return False
 
-    # Proceed with first valid disturbance in window
+    # Use first valid disturbance
     disturbance_idx = window_cps[0]
     disturbance_date = its_data.index[disturbance_idx]
 
+    # ➤ Metric: p-value from t-test — Tests if NTL deviation before and after disturbance differ significantly
     pre_dev = its_data.loc[:disturbance_date]['Deviation'].dropna()
     post_dev = its_data.loc[disturbance_date:]['Deviation'].dropna()
     t_stat, p_val = ttest_ind(pre_dev, post_dev, equal_var=False)
+
+    # ➤ Metric: Cohen's d — Measures how strong the NTL drop was
     d_val = cohen_d(pre_dev, post_dev) if len(pre_dev) > 5 and len(post_dev) > 5 else np.nan
 
+    # Skip if not statistically significant
     if p_val > 0.05:
         return False
 
-    # Detect recovery
+    # ➤ Metric: Recovery Duration — Days from disturbance to full recovery (Deviation ≥ 0)
     post_event = its_data.loc[disturbance_date:]
-    recovery_date, recovery_duration = (post_event[post_event['Deviation'] >= 0].index[0],
-                                        (post_event[post_event['Deviation'] >= 0].index[0] - disturbance_date).days) if (post_event['Deviation'] >= 0).any() else (np.nan, np.nan)
+    recovery_date, recovery_duration = (
+        post_event[post_event['Deviation'] >= 0].index[0],
+        (post_event[post_event['Deviation'] >= 0].index[0] - disturbance_date).days
+    ) if (post_event['Deviation'] >= 0).any() else (np.nan, np.nan)
 
-    # Save change points
-    cp_df = pd.DataFrame({"ChangePoint_Index": cps, "Date": its_data.index[cps], "TrendBefore": trend_values[cps], "TrendAfter": trend_values[cps + 1]})
+    # Save all BEAST change points for transparency
+    cp_df = pd.DataFrame({
+        "ChangePoint_Index": cps,
+        "Date": its_data.index[cps],
+        "TrendBefore": trend_values[cps],
+        "TrendAfter": trend_values[cps + 1]
+    })
     cp_df.to_csv(os.path.join(output_dir, f"{settlement_id}_changepoints.csv"), index=False)
 
-    # Save time series
+    # Save full time series with trend and deviation
     its_data.to_csv(os.path.join(output_dir, f"BEAST_NTL_{settlement_id}.csv"))
 
     # === PLOTTING ===
+    # ➤ Shows Observed NTL, BEAST Trend, Cyclone, Disturbance, and Recovery
 
     # Full-range plot
     fig, ax1 = plt.subplots(figsize=(12, 4))
@@ -108,7 +128,7 @@ def process_settlement(settlement_id, df_ntl, output_dir, summary_records, cyclo
     plt.savefig(os.path.join(output_dir, f"BEAST_{settlement_id}_full.png"))
     plt.close()
 
-    # Zoomed-in plot
+    # Zoomed-in plot ±60 days
     zoom_start = cyclone_date - timedelta(days=60)
     zoom_end = cyclone_date + timedelta(days=60)
     zoom_data = its_data.loc[zoom_start:zoom_end]
@@ -131,10 +151,14 @@ def process_settlement(settlement_id, df_ntl, output_dir, summary_records, cyclo
     plt.close()
 
     # === Stats Summary ===
+
+    # ➤ Metric: R² — Goodness of fit between actual NTL and BEAST trend
+    # ➤ Metric: RMSE — Average prediction error
     aligned = its_data[['NTLmean', 'BEAST_Trend']].dropna()
     r2 = r2_score(aligned['NTLmean'], aligned['BEAST_Trend'])
     rmse = np.sqrt(mean_squared_error(aligned['NTLmean'], aligned['BEAST_Trend']))
 
+    # ➤ Final Summary Row for CSV
     summary_records.append({
         "Settlement ID": settlement_id,
         "R²": round(r2, 3),
